@@ -1,0 +1,132 @@
+version: '3.8'
+
+# ============================================================
+#  AsyncPay Lab — Distributed Financial System Security Lab
+# ============================================================
+#  Network Topology:
+#    public_net  → Gateway (user-facing) + Attacker
+#    internal_net → All backend services (RabbitMQ, Orchestrator,
+#                   Bank Service, PostgreSQL)
+#
+#  The Gateway bridges both networks.
+#  The Attacker starts on BOTH networks to simulate a
+#  compromised network position (post-breach scenario).
+# ============================================================
+
+services:
+
+  # ── Message Broker (Async Backbone) ──────────────────────
+  rabbitmq:
+    image: rabbitmq:3-management
+    hostname: rabbitmq
+    ports:
+      - "5672:5672"      # AMQP protocol
+      - "15672:15672"    # Management UI (deliberately exposed)
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    networks:
+      - internal_net
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Database (Account Ledger) ────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    hostname: postgres
+    environment:
+      POSTGRES_DB: bankdb
+      POSTGRES_USER: bankuser
+      POSTGRES_PASSWORD: bankpass
+    volumes:
+      - ./bank_service/init_db.sql:/docker-entrypoint-initdb.d/01_init.sql
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - internal_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bankuser -d bankdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── API Gateway (Synchronous Entry Point) ────────────────
+  gateway:
+    build: ./gateway
+    hostname: gateway
+    ports:
+      - "8080:8080"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      POSTGRES_HOST: postgres
+    networks:
+      - public_net
+      - internal_net
+    restart: unless-stopped
+
+  # ── Transaction Orchestrator (Saga Coordinator) ──────────
+  orchestrator:
+    build: ./orchestrator
+    hostname: orchestrator
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+    networks:
+      - internal_net
+    restart: unless-stopped
+
+  # ── Bank Service (Account Operations) ────────────────────
+  # Scale with: docker compose up --scale bank_service=3
+  # Multiple instances = wider race condition window
+  bank_service:
+    build: ./bank_service
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      POSTGRES_HOST: postgres
+    networks:
+      - internal_net
+    restart: unless-stopped
+
+  # ── Attacker Workstation ─────────────────────────────────
+  # On BOTH networks: simulates post-breach access
+  attacker:
+    build: ./attacker
+    hostname: attacker
+    depends_on:
+      - gateway
+    networks:
+      - public_net
+      - internal_net
+    stdin_open: true
+    tty: true
+
+networks:
+  public_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+  internal_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/24
+
+volumes:
+  pgdata:
